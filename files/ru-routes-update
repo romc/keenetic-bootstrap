@@ -1,0 +1,217 @@
+#!/bin/sh
+# keenetic-bootstrap: ru-routes-update
+#
+# Builds the list of Russian IPv4 networks and hands it to bird as routes via
+# the ISP interface.
+#
+# Sources: delegated-extended statistics of the five RIRs (RIPE NCC is
+# required, the others are optional) plus the runetfreedom GeoIP RU list
+# (optional, GEOIP=0 turns it off). Each source is cached and downloaded again
+# only when it changed on the server (If-Modified-Since); if a download fails
+# the cached copy is used. bird is reloaded only when the routes changed.
+#
+#   ru-routes-update [--force] [--no-reload] [--quiet]
+#
+# Settings: /opt/etc/ru-routes.conf (written by setup.sh).
+
+set -u
+PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+CONF=${CONF:-/opt/etc/ru-routes.conf}
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+ISP_IFACE=${ISP_IFACE:-eth3}
+ISP_GW=${ISP_GW:-auto}            # auto | none | <gateway address>
+GEOIP=${GEOIP:-1}
+MIN_PREFIXES=${MIN_PREFIXES:-1000}
+STATE=${STATE:-/opt/var/lib/ru-routes}
+GEOIP_URL=${GEOIP_URL:-https://raw.githubusercontent.com/runetfreedom/russia-blocked-geoip/release/clash/classical/ru.txt}
+
+CACHE="$STATE/cache"
+ROUTES="$STATE/isp.routes"        # included by /opt/etc/bird.conf
+LIST="$STATE/ru-ipv4.txt"
+META="$STATE/meta"
+
+RIRS="
+ripencc required https://ftp.ripe.net/pub/stats/ripencc/delegated-ripencc-extended-latest
+apnic optional https://ftp.apnic.net/stats/apnic/delegated-apnic-extended-latest
+arin optional https://ftp.arin.net/pub/stats/arin/delegated-arin-extended-latest
+lacnic optional https://ftp.lacnic.net/pub/stats/lacnic/delegated-lacnic-extended-latest
+afrinic optional https://ftp.afrinic.net/pub/stats/afrinic/delegated-afrinic-extended-latest
+"
+
+FORCE=0
+RELOAD=1
+QUIET=0
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=1 ;;
+    --no-reload) RELOAD=0 ;;
+    --quiet) QUIET=1 ;;
+    *) echo "usage: ru-routes-update [--force] [--no-reload] [--quiet]" >&2; exit 2 ;;
+  esac
+done
+
+say() { [ "$QUIET" = 1 ] || printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+fail() { printf '%s ERROR: %s\n' "$(date '+%F %T')" "$*" >&2; exit 1; }
+
+for tool in curl iprange awk cmp; do
+  command -v "$tool" >/dev/null 2>&1 || fail "$tool not found"
+done
+
+mkdir -p "$CACHE" /opt/tmp || fail "cannot create $CACHE"
+WORK=$(mktemp -d /opt/tmp/ru-routes.XXXXXX) || fail "cannot create a temp dir"
+trap 'rm -rf "$WORK"' EXIT INT TERM
+
+# fetch <name> <url>: keeps a copy of <url> in $CACHE/<name>; fails only when
+# there is neither a fresh download nor an older copy.
+fetch() {
+  name=$1; url=$2; copy="$CACHE/$name"; part="$WORK/$name.part"
+  for try in 1 2 3; do
+    rm -f "$part"
+    if [ -s "$copy" ]; then
+      if curl -fsSL --connect-timeout 20 -m 300 -R -z "$copy" -o "$part" "$url"; then
+        # servers without If-Modified-Since support send the whole file again
+        if [ -s "$part" ] && ! cmp -s "$part" "$copy"; then
+          mv "$part" "$copy"
+          say "$name: updated"
+        else
+          say "$name: not modified"
+        fi
+        return 0
+      fi
+    elif curl -fsSL --connect-timeout 20 -m 300 -R -o "$part" "$url" && [ -s "$part" ]; then
+      mv "$part" "$copy"
+      say "$name: downloaded"
+      return 0
+    fi
+    sleep "$try"
+  done
+  if [ -s "$copy" ]; then
+    say "$name: download failed, using the cached copy"
+    return 0
+  fi
+  return 1
+}
+
+# RIR statistics: "registry|cc|type|start|count|date|status..." -> start-end ranges
+used=""
+skipped=""
+: > "$WORK/ranges"
+while read -r name kind url; do
+  [ -n "$name" ] || continue
+  if fetch "$name" "$url"; then
+    awk -F'|' '
+      $2 == "RU" && $3 == "ipv4" && $5 ~ /^[0-9]+$/ {
+        n = split($4, q, ".")
+        if (n != 4) next
+        first = ((q[1] * 256 + q[2]) * 256 + q[3]) * 256 + q[4]
+        last = first + $5 - 1
+        printf "%s-%d.%d.%d.%d\n", $4, int(last / 16777216) % 256, int(last / 65536) % 256, int(last / 256) % 256, last % 256
+      }' "$CACHE/$name" > "$WORK/$name.ranges"
+    if [ "$kind" = required ] && [ ! -s "$WORK/$name.ranges" ]; then
+      fail "$name has no RU IPv4 records"
+    fi
+    cat "$WORK/$name.ranges" >> "$WORK/ranges"
+    used="$used $name"
+  elif [ "$kind" = required ]; then
+    fail "cannot download $name: $url"
+  else
+    skipped="$skipped $name"
+  fi
+done <<EOF
+$RIRS
+EOF
+
+iprange "$WORK/ranges" > "$WORK/rir.cidr" || fail "iprange failed on RIR ranges"
+rir_count=$(wc -l < "$WORK/rir.cidr" | tr -d ' ')
+
+# GeoIP overlay: clash "classical" rules, IP-CIDR lines
+geoip_count=0
+: > "$WORK/geoip.cidr"
+if [ "$GEOIP" = 1 ]; then
+  if fetch geoip "$GEOIP_URL"; then
+    awk -F, '
+      /IP-CIDR,/ {
+        sub(/^.*IP-CIDR,/, "")
+        split($0, f, ",")
+        if (f[1] ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/) print f[1]
+      }' "$CACHE/geoip" > "$WORK/geoip.raw"
+    if [ -s "$WORK/geoip.raw" ]; then
+      iprange "$WORK/geoip.raw" > "$WORK/geoip.cidr" || fail "iprange failed on GeoIP list"
+    fi
+    geoip_count=$(wc -l < "$WORK/geoip.cidr" | tr -d ' ')
+    if [ "$geoip_count" -lt "$MIN_PREFIXES" ]; then
+      say "geoip: only $geoip_count prefixes, ignored"
+      : > "$WORK/geoip.cidr"
+      geoip_count=0
+    fi
+  else
+    skipped="$skipped geoip"
+  fi
+fi
+
+# iprange prints single addresses without a prefix length; bird needs one
+iprange "$WORK/rir.cidr" "$WORK/geoip.cidr" | awk '/^[0-9.]+$/ { $0 = $0 "/32" } /^[0-9.]+\/[0-9]+$/' > "$WORK/list" \
+  || fail "iprange failed on the merged list"
+count=$(wc -l < "$WORK/list" | tr -d ' ')
+[ "$count" -ge "$MIN_PREFIXES" ] || fail "only $count prefixes generated, keeping the current routes"
+
+# Ethernet ISP: route via its gateway (the ISP router may not answer ARP for
+# arbitrary addresses); point-to-point links (PPPoE/L2TP/PPTP): via the device.
+gw=""
+case "$ISP_GW" in
+  none) ;;
+  auto)
+    case "$ISP_IFACE" in
+      ppp*|l2tp*|pptp*) ;;
+      *)
+        gw=$(ip route show table all 2>/dev/null | awk -v dev="$ISP_IFACE" '
+          $1 == "default" && $2 == "via" { for (i = 3; i < NF; i++) if ($i == "dev" && $(i + 1) == dev) { print $3; exit } }')
+        ;;
+    esac
+    ;;
+  *) gw=$ISP_GW ;;
+esac
+
+if [ -n "$gw" ]; then
+  awk -v gw="$gw" -v dev="$ISP_IFACE" '{ printf "route %s via %s dev \"%s\" onlink;\n", $1, gw, dev }' "$WORK/list" > "$WORK/routes"
+  via="$gw dev $ISP_IFACE"
+else
+  awk -v dev="$ISP_IFACE" '{ printf "route %s via \"%s\";\n", $1, dev }' "$WORK/list" > "$WORK/routes"
+  via="dev $ISP_IFACE"
+fi
+
+say "$count prefixes (RIR $rir_count, GeoIP $geoip_count) via $via; sources:$used${skipped:+; skipped:$skipped}"
+
+if [ "$FORCE" = 0 ] && [ -f "$ROUTES" ] && cmp -s "$WORK/routes" "$ROUTES"; then
+  say "routes unchanged"
+  exit 0
+fi
+
+[ -f "$ROUTES" ] && cp "$ROUTES" "$ROUTES.prev"
+mv "$WORK/routes" "$ROUTES" || fail "cannot write $ROUTES"
+mv "$WORK/list" "$LIST"
+{
+  echo "updated=$(date '+%F %T %z')"
+  echo "prefixes=$count"
+  echo "rir_prefixes=$rir_count"
+  echo "geoip_prefixes=$geoip_count"
+  echo "sources=${used# }"
+  echo "skipped=${skipped# }"
+  echo "via=$via"
+} > "$META"
+say "routes updated"
+
+if [ "$RELOAD" = 1 ] && pidof bird >/dev/null 2>&1; then
+  if out=$(birdc configure 2>&1) && ! printf '%s\n' "$out" | grep -qiE 'error|failed'; then
+    say "bird reloaded"
+  else
+    if [ -f "$ROUTES.prev" ]; then
+      mv "$ROUTES.prev" "$ROUTES"
+      birdc configure >/dev/null 2>&1
+    fi
+    fail "birdc configure failed, previous routes restored: $(printf '%s\n' "$out" | tail -1)"
+  fi
+fi

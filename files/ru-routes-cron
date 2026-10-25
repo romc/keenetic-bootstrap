@@ -1,0 +1,17 @@
+#!/bin/sh
+# keenetic-bootstrap: run from cron every 4 hours. Only runs that changed the
+# routes or failed are written to the log, which is kept under 256 KB.
+
+LOG=/opt/var/log/ru-routes.log
+mkdir -p /opt/var/log
+
+out=$(/opt/sbin/ru-routes-update 2>&1)
+rc=$?
+if [ "$rc" -ne 0 ] || ! printf '%s\n' "$out" | grep -q 'routes unchanged'; then
+  { echo "== $(date '+%F %T') rc=$rc"; printf '%s\n' "$out"; } >> "$LOG"
+fi
+
+if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 262144 ]; then
+  tail -c 131072 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+exit "$rc"

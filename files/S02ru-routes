@@ -1,0 +1,32 @@
+#!/bin/sh
+# keenetic-bootstrap: policy rule that sends traffic to the table bird fills
+# with Russian networks (lookup there first, the main table - with the default
+# route via VPN - after it).
+
+PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# shellcheck disable=SC1091
+[ -f /opt/etc/ru-routes.conf ] && . /opt/etc/ru-routes.conf
+TABLE=${TABLE:-1100}
+PRIO=${PRIO:-30100}
+
+present() { ip rule show | grep -q "^$PRIO:"; }
+
+case "$1" in
+  start)
+    present || ip rule add priority "$PRIO" table "$TABLE"
+    ;;
+  stop)
+    while present; do ip rule del priority "$PRIO" || break; done
+    ;;
+  restart)
+    "$0" stop
+    "$0" start
+    ;;
+  status)
+    if present; then echo "rule $PRIO -> table $TABLE: on"; else echo "rule $PRIO: off"; fi
+    ;;
+  *)
+    echo "usage: $0 start|stop|restart|status" >&2
+    exit 2
+    ;;
+esac

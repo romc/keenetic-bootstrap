@@ -1,0 +1,14 @@
+#!/bin/sh
+# keenetic-bootstrap extra
+# Unreachable routes for Cloudflare IPv6 prefixes, so that clients fall back to
+# IPv4 (and its VPN routing) instead of reaching Cloudflare via a native/6in4 IPv6 path.
+PREFIXES="2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32"
+case "$1" in
+  stop)
+    for p in $PREFIXES; do ip -6 route del unreachable $p metric 42700 2>/dev/null || true; done
+    ;;
+  *)
+    for p in $PREFIXES; do ip -6 route replace unreachable $p metric 42700; done
+    ;;
+esac
+exit 0

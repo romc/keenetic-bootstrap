@@ -1,0 +1,14 @@
+#!/bin/sh
+# keenetic-bootstrap extra
+# entware init for /opt/bin/cpuwatch.sh
+PIDFILE=/opt/var/run/cpuwatch.pid
+case "$1" in
+  start)
+    [ -f $PIDFILE ] && kill -0 $(cat $PIDFILE) 2>/dev/null && exit 0
+    nice -n 10 /opt/bin/cpuwatch.sh </dev/null >/dev/null 2>&1 &
+    echo $! > $PIDFILE ;;
+  stop)
+    [ -f $PIDFILE ] && kill $(cat $PIDFILE) 2>/dev/null; rm -f $PIDFILE ;;
+  restart) "$0" stop; sleep 1; "$0" start ;;
+  status) [ -f $PIDFILE ] && kill -0 $(cat $PIDFILE) 2>/dev/null && echo running || echo stopped ;;
+esac
